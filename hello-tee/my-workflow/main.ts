@@ -2,7 +2,11 @@ import {
   cre,
   Runner,
   HTTPClient,
+  EVMClient,
   ok,
+  getNetwork,
+  hexToBase64,
+  bytesToHex,
   consensusIdenticalAggregation,
   type Runtime,
   type NodeRuntime,
@@ -10,12 +14,16 @@ import {
   type SecretsProvider,
 } from "@chainlink/cre-sdk"
 import { z } from "zod"
+import { encodeAbiParameters, parseAbiParameters } from "viem"
 
 // ── Config Schema ───────────────────────────────────────
 const configSchema = z.object({
   schedule: z.string(),
   inputData: z.string(),
   apiUrl: z.string(),
+  predictionMarketAddress: z.string(),
+  marketId: z.string(),
+  chainSelectorName: z.string(),
 })
 
 type Config = z.infer<typeof configSchema>
@@ -37,28 +45,16 @@ function deterministicHash(str: string): string {
   return combined.toString(16).padStart(16, "0")
 }
 
-// ── Output Type ─────────────────────────────────────────
-interface ConfidentialOutput {
-  workflowId: string
-  runId: string
-  inputCommitment: string
-  result: string
-  decidedAt: string
-  codeVersion: string
-}
-
-// ── Fetch Live Data (high-level pattern) ────────────────
+// ── Fetch Live Data ─────────────────────────────────────
 const fetchMarketData = (sendRequester: HTTPSendRequester, config: Config): string => {
   const response = sendRequester.sendRequest({
     url: config.apiUrl,
     method: "GET" as const,
   }).result()
-
   return new TextDecoder().decode(response.body)
 }
 
-// ── Call LLM (low-level pattern) ────────────────────────
-// apiKey is passed IN as an argument, not fetched inside
+// ── Call LLM ────────────────────────────────────────────
 const callLLM = (nodeRuntime: NodeRuntime<Config>, apiKey: string): string => {
   const bodyObj = {
     contents: [
@@ -92,7 +88,6 @@ const callLLM = (nodeRuntime: NodeRuntime<Config>, apiKey: string): string => {
 
   nodeRuntime.log(`[LLM] Status: ${resp.statusCode}`)
   const responseBody = new TextDecoder().decode(resp.body)
-  nodeRuntime.log(`[LLM] Response: ${responseBody}`)
 
   if (!ok(resp)) {
     throw new Error(`LLM request failed: ${resp.statusCode}`)
@@ -102,27 +97,25 @@ const callLLM = (nodeRuntime: NodeRuntime<Config>, apiKey: string): string => {
   return parsed.candidates[0].content.parts[0].text
 }
 
-const computeConfidential = (
-  input: string,
-  marketData: string
-): ConfidentialOutput => {
-  const inputCommitment = deterministicHash(input)
-  const evidenceHash = deterministicHash(marketData)
-  const result = deterministicHash(input + "::" + marketData)
-
-  return {
-    workflowId: "hello-confidential-v1",
-    runId: `run-${deterministicHash(input + "::" + evidenceHash)}`,
-    inputCommitment,
-    result,
-    decidedAt: new Date().toISOString(),
-    codeVersion: "0.3.0",
+// ── Parse LLM outcome to uint8 ─────────────────────────
+function parseOutcome(llmResponse: string): number {
+  // Clean markdown fences if present
+  const cleaned = llmResponse.replace(/```json\n?/g, "").replace(/```/g, "").trim()
+  try {
+    const parsed = JSON.parse(cleaned)
+    if (parsed.outcome === "YES") return 1
+    if (parsed.outcome === "NO") return 2
+  } catch {
+    // If JSON parsing fails, look for YES/NO in raw text
+    if (llmResponse.toUpperCase().includes("YES")) return 1
+    if (llmResponse.toUpperCase().includes("NO")) return 2
   }
+  return 0 // Unresolved
 }
 
 // ── Trigger Callback ────────────────────────────────────
 const onCronTrigger = (runtime: Runtime<Config>): string => {
-  runtime.log("=== Hello Confidential v3 — With LLM ===")
+  runtime.log("=== Prediction Market Resolution Workflow ===")
 
   // Step 1: Fetch live market data
   runtime.log("[STEP 1] Fetching market data...")
@@ -136,23 +129,74 @@ const onCronTrigger = (runtime: Runtime<Config>): string => {
     .result()
   runtime.log(`[STEP 1] Done: ${marketData}`)
 
-  // Step 2: Get secret at DON level, then pass to node mode
+  // Step 2: Call LLM for resolution
   runtime.log("[STEP 2] Calling LLM...")
   const secret = runtime.getSecret({ id: "GEMINI_API_KEY" }).result()
-
   const llmResponse = runtime.runInNodeMode(
     callLLM,
     consensusIdenticalAggregation<string>()
   )(secret.value).result()
   runtime.log(`[STEP 2] LLM says: ${llmResponse}`)
 
-  // Step 3: Hash everything
-  runtime.log("[STEP 3] Running confidential computation...")
-  const result = computeConfidential(
-    runtime.config.inputData,
-    llmResponse
+  // Step 3: Parse outcome
+  const outcome = parseOutcome(llmResponse)
+  const marketId = BigInt(runtime.config.marketId)
+  runtime.log(`[STEP 3] Parsed outcome: ${outcome} (1=YES, 2=NO) for market ${marketId}`)
+
+  if (outcome === 0) {
+    runtime.log("[STEP 3] Could not determine outcome. Skipping on-chain write.")
+    return JSON.stringify({ status: "unresolved", llmResponse })
+  }
+
+  // Step 4: Encode resolution data for on-chain
+  runtime.log("[STEP 4] Encoding report...")
+  const encodedPayload = encodeAbiParameters(
+    parseAbiParameters("uint256 marketId, uint8 outcome"),
+    [marketId, outcome]
   )
-  runtime.log(`Output: ${JSON.stringify(result)}`)
+  runtime.log(`[STEP 4] Encoded: ${encodedPayload}`)
+
+  // Step 5: Generate DON-signed report
+  runtime.log("[STEP 5] Generating signed report...")
+  const reportResponse = runtime.report({
+    encodedPayload: hexToBase64(encodedPayload),
+    encoderName: "evm",
+    signingAlgo: "ecdsa",
+    hashingAlgo: "keccak256",
+  }).result()
+  runtime.log("[STEP 5] Report signed by DON")
+
+  // Step 6: Write to PredictionMarket contract via Forwarder
+  runtime.log("[STEP 6] Writing to chain...")
+  const network = getNetwork({
+    chainFamily: "evm",
+    chainSelectorName: runtime.config.chainSelectorName,
+    isTestnet: true,
+  })
+
+  if (!network) {
+    throw new Error(`Network not found: ${runtime.config.chainSelectorName}`)
+  }
+
+  const evmClient = new EVMClient(network.chainSelector.selector)
+  const writeResult = evmClient.writeReport(runtime, {
+    receiver: runtime.config.predictionMarketAddress,
+    report: reportResponse,
+    gasConfig: { gasLimit: "500000" },
+  }).result()
+
+  const txHash = bytesToHex(writeResult.txHash || new Uint8Array(32))
+  runtime.log(`[STEP 6] TX submitted: ${txHash}`)
+
+  // Step 7: Return full result
+  const result = {
+    marketId: runtime.config.marketId,
+    outcome: outcome === 1 ? "YES" : "NO",
+    confidence: llmResponse,
+    evidenceHash: deterministicHash(marketData),
+    txHash,
+  }
+  runtime.log(`Result: ${JSON.stringify(result)}`)
 
   return JSON.stringify(result)
 }
