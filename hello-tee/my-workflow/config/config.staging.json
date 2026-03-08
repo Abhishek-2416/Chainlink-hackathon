@@ -1,6 +1,6 @@
 {
   "schedule": "* * * * *",
   "backendUrl": "http://localhost:3001",
-  "predictionMarketAddress": "0x45e7911Af8c31bDeDf8A586BeEd8efEcACEb9c37",
-  "chainSelectorName": "ethereum-testnet-sepolia"
+  "predictionMarketAddress": "0x5E63F5Dc74999380F88AD318e2f4ee691Ad807Ad",
+  "chainSelectorName": "ethereum-testnet-sepolia-base-1"
 }
