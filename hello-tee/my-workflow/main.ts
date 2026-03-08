@@ -196,7 +196,7 @@ const onCronTrigger = (runtime: Runtime<Config>): string => {
 
   // Check if backend returned a market or null
   const parsed = JSON.parse(marketDataRaw)
-  if (parsed.market === null || !parsed.marketId) {
+  if (parsed.market === null || parsed.marketId === undefined || parsed.marketId === null) {
     runtime.log("[STEP 1] No markets ready for resolution. Exiting.")
     return JSON.stringify({ status: "idle", message: "No markets ready for resolution" })
   }

@@ -15843,7 +15843,7 @@ var onCronTrigger = (runtime2) => {
   const marketDataRaw = httpClient.sendRequest(runtime2, fetchMarketData, consensusIdenticalAggregation())(runtime2.config).result();
   runtime2.log(`[STEP 1] Got response: ${marketDataRaw.substring(0, 200)}...`);
   const parsed = JSON.parse(marketDataRaw);
-  if (parsed.market === null || !parsed.marketId) {
+  if (parsed.market === null || parsed.marketId === undefined || parsed.marketId === null) {
     runtime2.log("[STEP 1] No markets ready for resolution. Exiting.");
     return JSON.stringify({ status: "idle", message: "No markets ready for resolution" });
   }

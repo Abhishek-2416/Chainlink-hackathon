@@ -6,7 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Config ──────────────────────────────────────────────────
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:3001";
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "60000"); // 1 minute
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "10000"); // 1 minute
 const WORKFLOW_DIR = path.resolve(__dirname, "../my-workflow");
 const HELLO_TEE_DIR = path.resolve(__dirname, "..");
 const CRE_TARGET = process.env.CRE_TARGET || "staging-settings";
@@ -22,7 +22,7 @@ async function checkForMarkets() {
       return null;
     }
     const data = await res.json();
-    if (data.market === null || !data.marketId) {
+    if (data.market === null || data.marketId === undefined || data.marketId === null) {
       return null;
     }
     return data;

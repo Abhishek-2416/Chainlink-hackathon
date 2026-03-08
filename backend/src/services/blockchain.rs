@@ -304,7 +304,7 @@ impl BlockchainService {
             .provider
             .get_transaction_count(wallet.address(), None)
             .await?;
-        let gas_price = self.provider.get_gas_price().await?;
+        let gas_price = U256::from(200_000_000u64);
 
         let tx = TransactionRequest::new()
             .to(self.contract_address)
