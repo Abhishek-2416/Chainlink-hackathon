@@ -4,6 +4,7 @@ import {
   AreaSeries,
   type IChartApi,
   type ISeriesApi,
+  type UTCTimestamp,
   ColorType,
   CrosshairMode,
 } from "lightweight-charts";
@@ -50,7 +51,6 @@ export function ProbabilityChart({
   height = 320,
   className = "",
   yesProbability,
-  noProbability,
 }: ProbabilityChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -60,7 +60,7 @@ export function ProbabilityChart({
   const chartData = useMemo(
     () =>
       normalizeChartData(data).map((d) => ({
-        time: d.time as number,
+        time: d.time as UTCTimestamp,
         value: d.value * 100,
       })),
     [data]
