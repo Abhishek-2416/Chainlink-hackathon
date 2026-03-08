@@ -474,4 +474,43 @@ export const marketService = {
       totalRedeemable: data.totalRedeemable ?? 0,
     };
   },
+
+  /**
+   * Claim rewards for a resolved market. Calls backend to validate and get claim data,
+   * then the frontend executes redeemWinning on-chain with the returned args.
+   */
+  async claimRewards(
+    address: string,
+    marketId: number
+  ): Promise<{
+    marketId: number;
+    redeemableShares: number;
+    contractAddress: string;
+    profit: number;
+  }> {
+    const res = await fetch(
+      `${API_BASE}/api/portfolio/${encodeURIComponent(address)}/claim`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ market_id: marketId }),
+      }
+    );
+    if (!res.ok) {
+      const err = (await res.json().catch(() => ({}))) as { error?: string; detail?: string; message?: string };
+      throw new Error(err?.error ?? err?.detail ?? err?.message ?? "Claim failed");
+    }
+    const data = (await res.json()) as {
+      marketId: number;
+      redeemableShares: number;
+      contractAddress: string;
+      profit: number;
+    };
+    return {
+      marketId: data.marketId,
+      redeemableShares: data.redeemableShares,
+      contractAddress: data.contractAddress,
+      profit: data.profit,
+    };
+  },
 };
