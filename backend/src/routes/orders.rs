@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use tracing::instrument;
 
 use crate::error::AppError;
 use crate::services::AppState;
@@ -26,6 +27,7 @@ pub struct UserOrdersQuery {
 
 /// POST /api/orders/quote
 /// Returns the EIP-712 payload for the user to sign. No DB write yet.
+#[instrument(skip(state, req), fields(market_id = req.market_id, token = %req.token))]
 async fn quote(
     State(state): State<AppState>,
     Json(req): Json<OrderRequest>,
@@ -62,11 +64,13 @@ async fn quote(
         .await
         .ok(); // non-fatal
 
+    tracing::info!(market_id = req.market_id, token = %req.token, price_cents = quote.order.price_cents, "quote created");
     Ok(Json(quote))
 }
 
 /// POST /api/orders
 /// Submit a signed order. Backend stores it then immediately calls fillOrder.
+#[instrument(skip(state, req), fields(market_id = req.market_id, user = %req.user_address))]
 async fn submit_order(
     State(state): State<AppState>,
     Json(req): Json<SubmitOrderRequest>,
@@ -117,13 +121,17 @@ async fn submit_order(
         "price":   req.price
     });
     if let Some(tx) = tx_hash {
-        resp["txHash"] = serde_json::Value::String(tx);
+        resp["txHash"] = serde_json::Value::String(tx.clone());
+        tracing::info!(order_id = order_id, market_id = req.market_id, tx_hash = %tx, "order filled");
+    } else {
+        tracing::info!(order_id = order_id, market_id = req.market_id, "order queued pending");
     }
     Ok(Json(resp))
 }
 
 /// POST /api/orders/batch
 /// Fill multiple pending orders in a single on-chain transaction for gas savings.
+#[instrument(skip(state, req), fields(order_count = req.order_ids.len()))]
 async fn batch_fill(
     State(state): State<AppState>,
     Json(req): Json<BatchFillRequest>,
@@ -154,6 +162,15 @@ async fn batch_fill(
     if rows.is_empty() {
         return Err(AppError::BadRequest("No pending orders found for given IDs".into()));
     }
+
+    // Contract requires nonces to be used sequentially per user. Sort by (user_address, nonce)
+    // so that batch fill succeeds on-chain.
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
+        a.user_address
+            .cmp(&b.user_address)
+            .then_with(|| a.nonce.cmp(&b.nonce))
+    });
 
     let mut contract_orders = Vec::with_capacity(rows.len());
     let mut signatures = Vec::with_capacity(rows.len());
@@ -196,6 +213,7 @@ async fn batch_fill(
         .map_err(AppError::Db)?;
     }
 
+    tracing::info!(filled_count = rows.len(), tx_hash = %tx_hex, "batch fill completed");
     Ok(Json(serde_json::json!({
         "txHash":     tx_hex,
         "filledCount": rows.len(),
@@ -218,6 +236,7 @@ struct BatchOrderRow {
 
 /// GET /api/orders/:market_id
 /// Live orderbook: aggregated YES/NO bids + implied prices.
+#[instrument(skip(state), fields(market_id = %market_id))]
 async fn get_orderbook(
     State(state): State<AppState>,
     Path(market_id): Path<i32>,
@@ -227,7 +246,8 @@ async fn get_orderbook(
 }
 
 /// GET /api/orders/user/:address?market_id=...
-/// All orders for a user with their total value (cost sum).
+/// All orders for a user with their total value (cost sum), market context, and buy prices.
+#[instrument(skip(state), fields(address = %address))]
 async fn get_user_orders(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -242,9 +262,36 @@ async fn get_user_orders(
     let total_shares: i64 = orders.iter().map(|o| o.shares).sum();
     let filled_count = orders.iter().filter(|o| o.status == "filled").count();
 
+    let orders_json: Vec<_> = orders
+        .iter()
+        .map(|o| {
+            let price_per_share_cents = if o.shares > 0 {
+                ((o.cost * 100) / o.shares).clamp(1, 99)
+            } else {
+                o.price as i64
+            };
+            serde_json::json!({
+                "id":              o.id,
+                "marketId":        o.market_id,
+                "marketQuestion":  o.market_question,
+                "marketStatus":    o.market_status,
+                "marketOutcome":   o.market_outcome,
+                "token":           o.token,
+                "shares":          o.shares,
+                "cost":            o.cost,
+                "price":           o.price,
+                "pricePerShare":   price_per_share_cents,
+                "status":          o.status,
+                "createdAt":       o.created_at,
+                "filledAt":        o.filled_at,
+                "txHash":          o.tx_hash,
+            })
+        })
+        .collect();
+
     Ok(Json(serde_json::json!({
         "address":      address,
-        "orders":       orders,
+        "orders":       orders_json,
         "totalCost":    total_cost,
         "totalShares":  total_shares,
         "filledCount":  filled_count,
@@ -255,6 +302,7 @@ async fn get_user_orders(
 /// DELETE /api/orders/:order_id/cancel
 /// Soft-cancel a pending order (on-chain nonce is NOT invalidated here;
 /// the order simply won't be batch-filled by the backend).
+#[instrument(skip(state), fields(order_id = %order_id))]
 async fn cancel_order(
     State(state): State<AppState>,
     Path(order_id): Path<i32>,

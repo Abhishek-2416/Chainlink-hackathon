@@ -21,11 +21,19 @@ async fn main() -> Result<()> {
         )
         .with_target(true)
         .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
         .init();
 
+    tracing::info!("Watcher starting");
     let config = config::Config::from_env()?;
-    let pool = db::create_pool(&config.database_url).await?;
+    tracing::info!(rpc_url = %config.rpc_url, chain_id = config.chain_id, "config loaded");
 
+    tracing::info!("Connecting to database");
+    let pool = db::create_pool(&config.database_url).await?;
+    tracing::info!("Database connected");
+
+    tracing::info!("Connecting to RPC");
     let provider = Provider::<Http>::try_from(&config.rpc_url)?;
     let provider = Arc::new(provider);
 
@@ -35,7 +43,8 @@ async fn main() -> Result<()> {
         config.chain_id,
         config.prediction_market_address.clone(),
     );
-    cursor.load().await?;
+    let last_block = cursor.load().await?;
+    tracing::info!(last_block = last_block, "cursor loaded");
     let cursor = Arc::new(cursor);
 
     // Start HTTP server for health/status
@@ -46,6 +55,7 @@ async fn main() -> Result<()> {
         provider: provider.clone(),
     };
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
+    tracing::info!(port = config.port, "HTTP server listening");
     let server = axum::serve(
         listener,
         axum::Router::new()
@@ -94,19 +104,25 @@ struct AppState {
 async fn health(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl axum::response::IntoResponse {
-    // Verify database connectivity
     match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.pool)
         .await
     {
-        Ok(_) => (axum::http::StatusCode::OK, "ok"),
-        Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "db unreachable"),
+        Ok(_) => {
+            tracing::debug!("health check ok");
+            (axum::http::StatusCode::OK, "ok")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "health check failed: db unreachable");
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "db unreachable")
+        }
     }
 }
 
 async fn status(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl axum::response::IntoResponse {
+    tracing::debug!("status request");
     let last_block = state.cursor.get();
     let current_block = state
         .provider
@@ -180,6 +196,7 @@ async fn run_watcher(
             continue;
         }
 
+        tracing::debug!(from_block, to_block, "fetching logs");
         let filter = Filter::new()
             .address(contract_addr)
             .from_block(BlockNumber::Number(U64::from(from_block)))
@@ -202,7 +219,9 @@ async fn run_watcher(
                 }
                 cursor.set(to_block).await?;
                 if count > 0 {
-                    info!(from_block, to_block, count, "Processed events");
+                    info!(from_block, to_block, count, "processed events");
+                } else {
+                    tracing::trace!(from_block, to_block, "no events in range");
                 }
                 from_block = to_block + 1;
             }

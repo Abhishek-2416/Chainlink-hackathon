@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use tracing::instrument;
 
 use crate::error::AppError;
 use crate::services::AppState;
@@ -26,6 +27,7 @@ pub fn router() -> Router<AppState> {
 
 /// GET /api/leaderboard?sort=volume&limit=20
 /// Top traders ranked by total volume, profit, or trade count.
+#[instrument(skip(state))]
 async fn get_leaderboard(
     State(state): State<AppState>,
     Query(q): Query<LeaderboardQuery>,

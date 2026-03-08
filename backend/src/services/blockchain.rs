@@ -229,6 +229,7 @@ impl BlockchainService {
 
     /// Submit fillOrder on-chain as the backend owner wallet.
     pub async fn fill_order(&self, order: ContractOrder, signature: Bytes) -> Result<H256> {
+        tracing::debug!(market_id = %order.market_id, outcome = order.outcome, "fill_order submitting");
         let wallet = self
             .wallet
             .as_ref()
@@ -260,6 +261,7 @@ impl BlockchainService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Transaction dropped from mempool"))?;
 
+        tracing::info!(tx_hash = ?receipt.transaction_hash, "fill_order succeeded");
         Ok(receipt.transaction_hash)
     }
 
@@ -304,8 +306,8 @@ impl BlockchainService {
             .provider
             .get_transaction_count(wallet.address(), None)
             .await?;
-        let gas_price = self.provider.get_gas_price().await?;
-
+        // let gas_price = self.provider.get_gas_price().await?;
+        let gas_price = U256::from(200_000_000u64);
         let tx = TransactionRequest::new()
             .to(self.contract_address)
             .data(calldata)
@@ -321,6 +323,7 @@ impl BlockchainService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Transaction dropped from mempool"))?;
 
+        tracing::info!(tx_hash = ?receipt.transaction_hash, "create_market succeeded");
         Ok(receipt.transaction_hash)
     }
 
@@ -383,6 +386,7 @@ impl BlockchainService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Transaction dropped from mempool"))?;
 
+        tracing::info!(tx_hash = ?receipt.transaction_hash, order_count = orders.len(), "batch_fill_orders succeeded");
         Ok(receipt.transaction_hash)
     }
 
@@ -408,6 +412,54 @@ impl BlockchainService {
             .nonce(nonce)
             .gas_price(gas_price)
             .gas(200_000u64)
+            .chain_id(self.chain_id);
+
+        let signed = wallet.sign_transaction(&tx.clone().into()).await?;
+        let raw = tx.rlp_signed(&signed);
+        let pending = self.provider.send_raw_transaction(raw).await?;
+        let receipt = pending
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Transaction dropped from mempool"))?;
+
+        tracing::info!(tx_hash = ?receipt.transaction_hash, market_id = market_id, "cancel_market succeeded");
+        Ok(receipt.transaction_hash)
+    }
+
+    /// ABI-encoded function selector for `redeemWinning(uint256,uint256)`.
+    fn redeem_winning_selector() -> [u8; 4] {
+        selector("redeemWinning(uint256,uint256)")
+    }
+
+    /// Call `redeemWinning(uint256 marketId, uint256 amount)` on-chain.
+    /// This is called by the user's wallet, but we provide a backend relay option.
+    pub async fn redeem_winning(
+        &self,
+        market_id: u64,
+        amount: u64,
+    ) -> Result<H256> {
+        let wallet = self
+            .wallet
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("BACKEND_PRIVATE_KEY not set"))?;
+
+        let mut calldata = Self::redeem_winning_selector().to_vec();
+        calldata.extend_from_slice(&encode(&[
+            Token::Uint(U256::from(market_id)),
+            Token::Uint(U256::from(amount)),
+        ]));
+
+        let nonce = self
+            .provider
+            .get_transaction_count(wallet.address(), None)
+            .await?;
+        let gas_price = self.provider.get_gas_price().await?;
+
+        let tx = TransactionRequest::new()
+            .to(self.contract_address)
+            .data(calldata)
+            .nonce(nonce)
+            .gas_price(gas_price)
+            .gas(300_000u64)
             .chain_id(self.chain_id);
 
         let signed = wallet.sign_transaction(&tx.clone().into()).await?;

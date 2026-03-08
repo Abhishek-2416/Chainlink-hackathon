@@ -5,6 +5,7 @@ use axum::{
 };
 use ethers::utils::keccak256;
 use serde::Deserialize;
+use tracing::instrument;
 
 use crate::error::AppError;
 use crate::services::AppState;
@@ -32,20 +33,25 @@ pub fn router() -> Router<AppState> {
         .route("/categories", get(get_categories))
         .route("/search", get(search_markets))
         .route("/ready-to-resolve", get(get_ready_to_resolve))
+        .route("/ready-to-resolve-multi", get(get_ready_to_resolve_multi))
+        .route("/resolved", get(get_resolved_markets))
         .route("/:market_id", get(get_market))
         .route("/:market_id/price", get(get_market_price))
         .route("/:market_id/activity", get(get_market_activity))
         .route("/:market_id/positions", get(get_market_positions))
         .route("/:market_id/cancel", post(cancel_market))
+        .route("/:market_id/claim", post(claim_market_rewards))
 }
 
 /// POST /api/markets
 /// Anyone can create a market. The backend hashes the question, calls createMarket
 /// on-chain, and stores the human-readable question so the UI shows it instead of the hash.
+#[instrument(skip(state, req))]
 async fn create_market(
     State(state): State<AppState>,
     Json(req): Json<CreateMarketRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    tracing::info!(category = %req.category, "create_market request");
     let question = req.question.trim().to_string();
     if question.is_empty() {
         return Err(AppError::BadRequest("Question cannot be empty".into()));
@@ -137,6 +143,7 @@ async fn create_market(
     .await
     .map_err(AppError::Db)?;
 
+    tracing::info!(market_id = next_id, tx_hash = %tx_hex, "market created");
     Ok(Json(serde_json::json!({
         "marketId":       next_id,
         "question":       question,
@@ -152,6 +159,7 @@ async fn create_market(
 /// GET /api/markets/ready-to-resolve
 /// Returns the oldest open market whose resolution_date has passed.
 /// Used by the CRE workflow to discover which market to resolve next.
+#[instrument(skip(state))]
 async fn get_ready_to_resolve(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -171,18 +179,133 @@ async fn get_ready_to_resolve(
     .map_err(AppError::Db)?;
 
     match market {
-        Some(m) => Ok(Json(serde_json::json!({
+        Some(m) => {
+            tracing::info!(market_id = m.market_id, question = %m.question, "ready_to_resolve found");
+            Ok(Json(serde_json::json!({
             "marketId":        m.market_id,
             "question":        m.question,
             "category":        m.category,
             "creatorAddress":  m.creator_address,
             "resolutionDate":  m.resolution_date,
             "status":          m.status,
-        }))),
-        None => Ok(Json(serde_json::json!({
-            "market": null
-        }))),
+        })))
+        }
+        None => {
+            tracing::debug!("ready_to_resolve: no markets pending");
+            Ok(Json(serde_json::json!({
+                "market": null
+            })))
+        }
     }
+}
+
+/// GET /api/markets/ready-to-resolve-multi
+/// Returns ALL open markets whose resolution_date has passed.
+#[instrument(skip(state))]
+async fn get_ready_to_resolve_multi(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let markets: Vec<MarketRow> = sqlx::query_as(
+        r#"
+        SELECT market_id, question, category, creator_address,
+               yes_token_address, no_token_address, resolution_date,
+               status, outcome, created_at
+        FROM markets
+        WHERE status = 'open' AND resolution_date <= NOW()
+        ORDER BY resolution_date ASC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::Db)?;
+
+    let out: Vec<_> = markets
+        .iter()
+        .map(|m| serde_json::json!({
+            "marketId":        m.market_id,
+            "question":        m.question,
+            "category":        m.category,
+            "creatorAddress":  m.creator_address,
+            "resolutionDate":  m.resolution_date,
+            "status":          m.status,
+        }))
+        .collect();
+
+    tracing::info!(count = out.len(), "ready_to_resolve_multi");
+    Ok(Json(serde_json::json!({
+        "markets": out,
+        "count":   out.len()
+    })))
+}
+
+/// GET /api/markets/resolved
+/// Returns all resolved markets with their outcomes.
+#[instrument(skip(state))]
+async fn get_resolved_markets(
+    State(state): State<AppState>,
+    Query(q): Query<MarketsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = q.limit.min(100);
+    let offset = q.offset;
+
+    let markets: Vec<MarketRow> = sqlx::query_as(
+        r#"
+        SELECT market_id, question, category, creator_address,
+               yes_token_address, no_token_address, resolution_date,
+               status, outcome, created_at
+        FROM markets
+        WHERE status = 'resolved'
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2
+        "#,
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::Db)?;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM markets WHERE status = 'resolved'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::Db)?;
+
+    let mut out = Vec::with_capacity(markets.len());
+    for m in &markets {
+        let ob = state.orderbook.get_orderbook(m.market_id).await;
+        let (yes_price, no_price) = ob.map(|o| (o.yes_price, o.no_price)).unwrap_or((50, 50));
+
+        let total_volume: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost), 0)::bigint FROM trades WHERE market_id = $1",
+        )
+        .bind(m.market_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::Db)?;
+
+        out.push(serde_json::json!({
+            "marketId":        m.market_id,
+            "question":        m.question,
+            "category":        m.category,
+            "creatorAddress":  m.creator_address,
+            "yesTokenAddress": m.yes_token_address,
+            "noTokenAddress":  m.no_token_address,
+            "yesPrice":        yes_price,
+            "noPrice":         no_price,
+            "resolutionDate":  m.resolution_date,
+            "status":          m.status,
+            "outcome":         m.outcome,
+            "totalVolume":     total_volume,
+            "createdAt":       m.created_at
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "markets": out,
+        "total":   total
+    })))
 }
 
 /// GET /api/markets
@@ -325,6 +448,7 @@ async fn list_markets(
 
 /// GET /api/markets/:market_id
 /// Full market detail: metadata + orderbook + price history + recent trades.
+#[instrument(skip(state), fields(market_id = %market_id))]
 async fn get_market(
     State(state): State<AppState>,
     Path(market_id): Path<i32>,
@@ -671,6 +795,7 @@ async fn get_market_positions(
 
 /// POST /api/markets/:market_id/cancel
 /// Cancel an open market. Calls cancelMarket on-chain and updates DB.
+#[instrument(skip(state), fields(market_id = %market_id))]
 async fn cancel_market(
     State(state): State<AppState>,
     Path(market_id): Path<i32>,
@@ -716,10 +841,124 @@ async fn cancel_market(
         .await
         .map_err(AppError::Db)?;
 
+    tracing::info!(market_id = market_id, tx_hash = %tx_hex, "market cancelled");
     Ok(Json(serde_json::json!({
         "marketId": market_id,
         "status":   "cancelled",
         "txHash":   tx_hex
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClaimMarketRequest {
+    pub user_address: String,
+}
+
+/// POST /api/markets/:market_id/claim
+/// Claim rewards for a resolved market.
+/// Body: { "user_address": "0x..." }
+#[instrument(skip(state, req), fields(market_id = %market_id))]
+async fn claim_market_rewards(
+    State(state): State<AppState>,
+    Path(market_id): Path<i32>,
+    Json(req): Json<ClaimMarketRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = req.user_address.to_lowercase();
+
+    #[derive(sqlx::FromRow)]
+    struct MarketInfo {
+        status: String,
+        outcome: Option<String>,
+        yes_token_address: Option<String>,
+        no_token_address: Option<String>,
+    }
+
+    let market: MarketInfo = sqlx::query_as(
+        "SELECT status, outcome, yes_token_address, no_token_address FROM markets WHERE market_id = $1",
+    )
+    .bind(market_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::Db)?
+    .ok_or(AppError::MarketNotFound(market_id))?;
+
+    if market.status != "resolved" {
+        return Err(AppError::BadRequest(format!(
+            "Market {} is not resolved (status: {})",
+            market_id, market.status
+        )));
+    }
+
+    let winning_outcome = market.outcome.as_deref().ok_or_else(|| {
+        AppError::BadRequest(format!("Market {} resolved but outcome is null", market_id))
+    })?;
+
+    // Use user_positions (decremented on redeem by watcher) for accurate remaining balance.
+    // Fallback to orders sum if user_positions not populated (e.g. watcher lag).
+    let shares: i64 = sqlx::query_scalar::<_, Option<i64>>(
+        r#"
+        SELECT COALESCE(
+            (SELECT shares FROM user_positions
+             WHERE market_id = $1 AND user_address = $2 AND token = $3 AND shares > 0),
+            (SELECT SUM(shares)::bigint FROM orders
+             WHERE market_id = $1 AND user_address = $2 AND status = 'filled' AND token = $3)
+        )
+        "#,
+    )
+    .bind(market_id)
+    .bind(&user)
+    .bind(winning_outcome)
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::Db)?
+    .unwrap_or(0);
+    if shares <= 0 {
+        return Err(AppError::BadRequest(format!(
+            "No redeemable shares for market {}. You need {} tokens to redeem.",
+            market_id, winning_outcome
+        )));
+    }
+
+    let winning_token = if winning_outcome == "YES" {
+        &market.yes_token_address
+    } else {
+        &market.no_token_address
+    };
+
+    let contract_address = std::env::var("PREDICTION_MARKET_ADDRESS")
+        .unwrap_or_else(|_| "0x45e7911Af8c31bDeDf8A586BeEd8efEcACEb9c37".into());
+
+    let original_cost: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(SUM(cost), 0)::bigint
+        FROM orders
+        WHERE market_id = $1 AND user_address = $2 AND status = 'filled' AND token = $3
+        "#,
+    )
+    .bind(market_id)
+    .bind(&user)
+    .bind(winning_outcome)
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::Db)?;
+
+    tracing::info!(market_id = market_id, user = %user, shares = shares, "claim data prepared");
+    Ok(Json(serde_json::json!({
+        "address":          user,
+        "marketId":         market_id,
+        "winningOutcome":   winning_outcome,
+        "winningToken":     winning_token,
+        "redeemableShares": shares,
+        "redemptionValue":  shares,
+        "originalCost":     original_cost,
+        "profit":           shares - original_cost,
+        "contractAddress":  contract_address,
+        "action": {
+            "method":   "redeemWinning",
+            "args":     [market_id, shares],
+            "to":       contract_address,
+            "note":     "Call redeemWinning(marketId, amount) on-chain from your wallet"
+        }
     })))
 }
 

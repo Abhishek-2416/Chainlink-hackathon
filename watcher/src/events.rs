@@ -43,20 +43,24 @@ fn format_tx_hash(h: Option<H256>) -> String {
         .unwrap_or_default()
 }
 
-#[instrument(skip(pool, log), fields(tx = ?log.transaction_hash,
-    block = ?log.block_number))]
+#[instrument(skip(pool, log), fields(tx = ?log.transaction_hash, block = ?log.block_number))]
 pub async fn process_log(pool: &PgPool, log: &Log) -> Result<()> {
     let topic0 = log.topics.get(0).copied().unwrap_or_default();
 
     if topic0 == MARKET_CREATED_TOPIC {
+        tracing::debug!(tx = ?log.transaction_hash, "processing MarketCreated");
         process_market_created(pool, log).await?;
     } else if topic0 == ORDER_FILLED_TOPIC {
+        tracing::debug!(tx = ?log.transaction_hash, "processing OrderFilled");
         process_order_filled(pool, log).await?;
     } else if topic0 == MARKET_RESOLVED_TOPIC {
+        tracing::debug!(tx = ?log.transaction_hash, "processing MarketResolved");
         process_market_resolved(pool, log).await?;
     } else if topic0 == MARKET_CANCELLED_TOPIC {
+        tracing::debug!(tx = ?log.transaction_hash, "processing MarketCancelled");
         process_market_cancelled(pool, log).await?;
     } else if topic0 == WINNINGS_REDEEMED_TOPIC {
+        tracing::debug!(tx = ?log.transaction_hash, "processing WinningsRedeemed");
         process_winnings_redeemed(pool, log).await?;
     }
 
@@ -160,7 +164,7 @@ async fn process_market_created(pool: &PgPool, log: &Log) -> Result<()> {
         );
     }
 
-    tracing::info!("MarketCreated: market_id={} tx={}", market_id_num, tx_hash);
+    tracing::info!(market_id = market_id_num, tx_hash = %tx_hash, "MarketCreated processed");
     Ok(())
 }
 
@@ -281,12 +285,12 @@ async fn process_order_filled(pool: &PgPool, log: &Log) -> Result<()> {
     }
 
     tracing::info!(
-        "OrderFilled: market_id={} buyer={} token={} shares={} cost={}",
-        market_id,
-        format_address(buyer),
-        token,
-        shares,
-        cost
+        market_id = %market_id,
+        buyer = %format_address(buyer),
+        token = %token,
+        shares = %shares,
+        cost = %cost,
+        "OrderFilled processed"
     );
     Ok(())
 }
@@ -316,11 +320,7 @@ async fn process_market_resolved(pool: &PgPool, log: &Log) -> Result<()> {
     .execute(pool)
     .await?;
 
-    tracing::info!(
-        "MarketResolved: market_id={} outcome={}",
-        market_id,
-        outcome_str
-    );
+    tracing::info!(market_id = %market_id, outcome = %outcome_str, "MarketResolved processed");
     Ok(())
 }
 
@@ -336,7 +336,7 @@ async fn process_market_cancelled(pool: &PgPool, log: &Log) -> Result<()> {
         .execute(pool)
         .await?;
 
-    tracing::info!("MarketCancelled: market_id={}", market_id);
+    tracing::info!(market_id = %market_id, "MarketCancelled processed");
     Ok(())
 }
 
@@ -408,11 +408,6 @@ async fn process_winnings_redeemed(pool: &PgPool, log: &Log) -> Result<()> {
         .await;
     }
 
-    tracing::info!(
-        "WinningsRedeemed: market_id={} user={} amount={}",
-        market_id,
-        user_addr,
-        amount
-    );
+    tracing::info!(market_id = %market_id, user = %user_addr, amount = %amount, "WinningsRedeemed processed");
     Ok(())
 }

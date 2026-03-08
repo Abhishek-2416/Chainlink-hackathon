@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use tracing::instrument;
 
 use crate::error::AppError;
 use crate::services::AppState;
@@ -21,6 +22,7 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Get actions needed for a user (e.g. sign order, approve USDC, redeem).
+#[instrument(skip(state), fields(address = %address))]
 async fn get_user_actions(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -65,6 +67,7 @@ async fn get_user_actions(
 }
 
 /// List all pending actions (admin/debug).
+#[instrument(skip(state))]
 async fn list_actions(
     State(state): State<AppState>,
     Query(query): Query<ActionQuery>,

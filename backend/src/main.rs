@@ -7,6 +7,8 @@ mod types;
 use axum::{routing::get, Router};
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use db::DbPool;
@@ -21,21 +23,44 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         ))
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_thread_ids(false)
+                .with_file(false)
+                .with_line_number(false),
+        )
         .init();
 
     let database_url = std::env::var("DATABASE_URL")
         .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
+    tracing::info!("Connecting to database");
     let pool = DbPool::connect(&database_url).await?;
+    tracing::info!("Database connected");
 
+    tracing::info!("Running migrations");
     sqlx::migrate!("./migrations").run(&pool).await?;
+    tracing::info!("Migrations complete");
 
     let state = AppState::new(pool).await?;
+    tracing::info!("AppState initialized");
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
+
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(
+            DefaultMakeSpan::new()
+                .level(Level::INFO)
+                .include_headers(false),
+        )
+        .on_response(
+            DefaultOnResponse::new()
+                .level(Level::INFO)
+                .include_headers(false),
+        );
 
     let app = Router::new()
         .route("/health", get(health))
@@ -44,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api/portfolio", portfolio::router())
         .nest("/api/actions", actions::router())
         .nest("/api/leaderboard", leaderboard::router())
+        .layer(trace_layer)
         .layer(cors)
         .with_state(state);
 
@@ -52,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    tracing::info!("Listening on {}", addr);
+    tracing::info!(port = port, "Server starting");
     axum::serve(
         tokio::net::TcpListener::bind(addr).await?,
         app,

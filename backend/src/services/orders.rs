@@ -250,6 +250,7 @@ impl OrderService {
     }
 
     /// All orders for a user, optionally filtered by market.
+    /// Joins with markets table for context (question, market status, outcome).
     pub async fn get_user_orders(
         &self,
         user_address: &str,
@@ -259,11 +260,15 @@ impl OrderService {
         let rows = if let Some(mid) = market_id {
             sqlx::query_as::<_, UserOrderRow>(
                 r#"
-                SELECT id, market_id, token, shares, cost, price,
-                       status, created_at, filled_at, tx_hash
-                FROM orders
-                WHERE user_address = $1 AND market_id = $2
-                ORDER BY created_at DESC
+                SELECT o.id, o.market_id, o.token, o.shares, o.cost, o.price,
+                       o.status, o.created_at, o.filled_at, o.tx_hash,
+                       m.question AS market_question,
+                       m.status   AS market_status,
+                       m.outcome  AS market_outcome
+                FROM orders o
+                JOIN markets m ON m.market_id = o.market_id
+                WHERE o.user_address = $1 AND o.market_id = $2
+                ORDER BY o.created_at DESC
                 "#,
             )
             .bind(&addr)
@@ -273,11 +278,15 @@ impl OrderService {
         } else {
             sqlx::query_as::<_, UserOrderRow>(
                 r#"
-                SELECT id, market_id, token, shares, cost, price,
-                       status, created_at, filled_at, tx_hash
-                FROM orders
-                WHERE user_address = $1
-                ORDER BY created_at DESC
+                SELECT o.id, o.market_id, o.token, o.shares, o.cost, o.price,
+                       o.status, o.created_at, o.filled_at, o.tx_hash,
+                       m.question AS market_question,
+                       m.status   AS market_status,
+                       m.outcome  AS market_outcome
+                FROM orders o
+                JOIN markets m ON m.market_id = o.market_id
+                WHERE o.user_address = $1
+                ORDER BY o.created_at DESC
                 "#,
             )
             .bind(&addr)
@@ -334,4 +343,7 @@ pub struct UserOrderRow {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub filled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub tx_hash: Option<String>,
+    pub market_question: Option<String>,
+    pub market_status: Option<String>,
+    pub market_outcome: Option<String>,
 }

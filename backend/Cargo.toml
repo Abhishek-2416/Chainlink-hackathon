@@ -8,7 +8,7 @@ description = "Prediction Market Backend - Rust Axum"
 # Web framework
 axum = { version = "0.7", features = ["json"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
