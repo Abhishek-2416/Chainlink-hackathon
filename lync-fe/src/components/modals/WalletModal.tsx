@@ -6,6 +6,7 @@ import { useUIStore } from "../../stores/uiStore";
 import { Button } from "../ui/Button";
 import { formatCurrency } from "../../utils/format";
 import { marketService } from "../../services/marketService";
+import { getWalletIcon } from "../../constants/walletIcons";
 
 export function WalletModal() {
   const { openModal, setOpenModal } = useUIStore();
@@ -13,6 +14,7 @@ export function WalletModal() {
   const { connectors, connectAsync, isPending, error } = useConnect();
   const { disconnect } = useDisconnect();
   const [balance, setBalance] = useState<{ eth: number; usdc: number } | null>(null);
+  const [connectingId, setConnectingId] = useState<string | null>(null);
 
   const isOpen = openModal === "wallet";
 
@@ -32,11 +34,14 @@ export function WalletModal() {
   };
 
   const handleConnect = async (connector: (typeof connectors)[number]) => {
+    setConnectingId(connector.uid);
     try {
       await connectAsync({ connector, chainId: baseSepolia.id });
       setOpenModal(null);
     } catch {
       // Keep modal open on error so user can retry or see error
+    } finally {
+      setConnectingId(null);
     }
   };
 
@@ -46,6 +51,7 @@ export function WalletModal() {
       onClose={() => setOpenModal(null)}
       title="Connect Wallet"
       size="sm"
+      height="60vh"
     >
       <div className="space-y-4">
         {isConnected && address ? (
@@ -80,17 +86,50 @@ export function WalletModal() {
               Login or sign up by connecting your wallet. No email or password required.
             </p>
             <div className="space-y-2">
-              {connectors.map((connector) => (
-                <Button
-                  key={connector.uid}
-                  variant="secondary"
-                  fullWidth
-                  onClick={() => handleConnect(connector)}
-                  disabled={isPending}
-                >
-                  {isPending ? "Connecting..." : connector.name}
-                </Button>
-              ))}
+              {connectors.map((connector) => {
+                const iconUrl = getWalletIcon(connector.name);
+                const isThisConnectorConnecting = connectingId === connector.uid;
+                return (
+                  <Button
+                    key={connector.uid}
+                    variant="secondary"
+                    fullWidth
+                    onClick={() => handleConnect(connector)}
+                    disabled={isPending}
+                    className="flex items-center justify-start gap-3"
+                  >
+                    <div className="w-6 h-6 flex items-center justify-center flex-shrink-0 rounded overflow-hidden bg-white/5">
+                      {iconUrl ? (
+                        <>
+                          <img
+                            src={iconUrl}
+                            alt=""
+                            className="w-5 h-5 object-contain"
+                            referrerPolicy="no-referrer"
+                            onError={(e) => {
+                              e.currentTarget.style.display = "none";
+                              const parent = e.currentTarget.parentElement;
+                              const fallback = parent?.querySelector(".wallet-icon-fallback");
+                              if (fallback) (fallback as HTMLElement).style.display = "flex";
+                            }}
+                          />
+                          <span
+                            className="wallet-icon-fallback w-5 h-5 flex items-center justify-center text-xs font-semibold text-muted-foreground"
+                            style={{ display: "none" }}
+                          >
+                            {(connector.name || "?")[0]}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="w-5 h-5 flex items-center justify-center text-xs font-semibold text-muted-foreground">
+                          {(connector.name || "?")[0]}
+                        </span>
+                      )}
+                    </div>
+                    {isThisConnectorConnecting ? "Connecting..." : connector.name}
+                  </Button>
+                );
+              })}
             </div>
             {error && (
               <p className="text-sm text-red-400">{error.message}</p>
